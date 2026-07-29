@@ -18,6 +18,7 @@ class ChatRequest(BaseModel):
     model: str | None = None
     max_turns: int = 10
     work_dir: str | None = None
+    backend: str = "claude"  # claude | codex | opencode
 
 
 # ── 响应 ──────────────────────────────────────────────

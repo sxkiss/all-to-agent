@@ -34,6 +34,7 @@ def list_conversations() -> list[dict]:
         result.append({
             "id": cid,
             "title": conv.get("title", ""),
+            "backend": conv.get("backend", "claude"),
             "message_count": len(conv.get("messages", [])),
             "created_at": conv.get("created_at", ""),
             "updated_at": conv.get("updated_at", ""),
@@ -47,13 +48,14 @@ def get_conversation(cid: str) -> dict | None:
     return data.get(cid)
 
 
-def create_conversation(title: str = "") -> str:
+def create_conversation(title: str = "", backend: str = "claude") -> str:
     cid = str(uuid.uuid4())[:8]
     now = datetime.now().isoformat()
     data = _load(_CONV_FILE)
     data[cid] = {
         "id": cid,
         "title": title or f"对话-{now[:16]}",
+        "backend": backend,
         "messages": [],
         "created_at": now,
         "updated_at": now,
@@ -62,7 +64,7 @@ def create_conversation(title: str = "") -> str:
     return cid
 
 
-def append_message(cid: str, role: str, content: str, model: str = "", usage: dict | None = None, tool_calls: list | None = None):
+def append_message(cid: str, role: str, content: str, model: str = "", usage: dict | None = None, tool_calls: list | None = None, backend: str = ""):
     data = _load(_CONV_FILE)
     if cid not in data:
         return
@@ -74,10 +76,14 @@ def append_message(cid: str, role: str, content: str, model: str = "", usage: di
         msg["usage"] = usage
     if tool_calls:
         msg["tool_calls"] = tool_calls
+    if backend:
+        msg["backend"] = backend
+        data[cid]["backend"] = backend  # update conv-level too
     data[cid]["messages"].append(msg)
     data[cid]["updated_at"] = now
     # 自动生成标题：取第一条用户消息前 30 字
     if role == "user" and not data[cid].get("title", "").startswith("对话-"):
+        prefix = {"claude": "🤖", "codex": "📐", "opencode": "🔓"}.get(backend, "")
         data[cid]["title"] = content[:30]
     _save(_CONV_FILE, data)
 

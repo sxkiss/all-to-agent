@@ -14,7 +14,7 @@ async def health():
     return {
         "status": "ok",
         "assistant": settings.ASSISTANT_NAME,
-        "model": settings.CLAUDE_MODEL,
+        "backends": ["claude", "codex", "opencode"],
         "uptime_seconds": round(time.time() - _start_time, 1),
         "conversations": len(store.list_conversations()),
         "tasks": len(store.list_tasks()),
