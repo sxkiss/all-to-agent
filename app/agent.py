@@ -1,4 +1,4 @@
-"""Agent 核心：统一调用 Claude / Codex / OpenCode CLI，解析事件。"""
+"""Agent 核心：多后端 CLI 调度 + 会话续接 + 事件解析。"""
 
 from __future__ import annotations
 import json
@@ -12,26 +12,7 @@ from app.models import Usage
 logger = logging.getLogger("agent")
 
 
-# ── CLI 配置 ──────────────────────────────────────────
-
-BACKENDS = {
-    "claude": {
-        "bin": "claude",
-        "base_args": lambda prompt, mt: ["-p", prompt, "--output-format", "stream-json", "--verbose", "--max-turns", str(mt)],
-        "model_arg": lambda m: ["--model", m] if m else [],
-    },
-    "codex": {
-        "bin": "codex",
-        "base_args": lambda prompt, mt: ["exec", "--json", "--skip-git-repo-check", prompt],
-        "model_arg": lambda m: ["-c", f'model="{m}"'] if m else [],
-    },
-    "opencode": {
-        "bin": "opencode",
-        "base_args": lambda prompt, mt: ["run", "--format", "json", "--dir", settings.WORK_DIR, prompt],
-        "model_arg": lambda m: ["-m", m] if m else [],
-    },
-}
-
+# ── 后端配置 ──────────────────────────────────────────
 
 def _build_cmd(
     backend: str,
@@ -39,22 +20,49 @@ def _build_cmd(
     model: str | None = None,
     max_turns: int = 10,
     work_dir: str | None = None,
+    session_id: str | None = None,
 ) -> list[str]:
-    cfg = BACKENDS.get(backend, BACKENDS["claude"])
-    cmd = [cfg["bin"]] + cfg["base_args"](prompt, max_turns) + cfg["model_arg"](model)
-    logger.info("[%s] %s", backend, " ".join(cmd[:8]))
+    """构建各后端 CLI 命令，支持 session_id 续接。"""
+    cwd = work_dir or settings.WORK_DIR
+
+    if backend == "codex":
+        if session_id:
+            cmd = ["codex", "resume", "--json", session_id, prompt]
+        else:
+            cmd = ["codex", "exec", "--json", "--skip-git-repo-check", prompt]
+        if model:
+            cmd += ["-c", f'model="{model}"']
+        return cmd
+
+    if backend == "opencode":
+        cmd = ["opencode", "run", "--format", "json", "--dir", cwd]
+        if session_id:
+            cmd += ["-s", session_id]
+        cmd.append(prompt)
+        if model:
+            cmd += ["-m", model]
+        return cmd
+
+    # claude (默认)
+    cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--max-turns", str(max_turns)]
+    if session_id:
+        cmd += ["--resume", session_id]
+    if model:
+        cmd += ["--model", model]
     return cmd
 
 
 # ── 事件解析 ──────────────────────────────────────────
 
-def _parse_event_claude(event: dict, tool_calls: list) -> dict:
-    """解析 Claude stream-json 事件。"""
+def _parse_claude(event: dict, tool_calls: list) -> dict:
     etype = event.get("type", "")
-    result = {"text": "", "tool": None, "final": None}
+    out = {"session_id": None, "text": "", "final": None, "usage": None}
 
-    if etype == "text":
-        result["text"] = event.get("text", "")
+    if etype == "system" and event.get("subtype") == "init":
+        out["session_id"] = event.get("session_id")
+
+    elif etype == "text":
+        out["text"] = event.get("text", "")
 
     elif etype == "assistant":
         for block in event.get("message", {}).get("content", []):
@@ -70,56 +78,48 @@ def _parse_event_claude(event: dict, tool_calls: list) -> dict:
                 tool_calls[-1]["result"] = tc_result
 
     elif etype == "result":
-        result["final"] = event.get("result", "")
-        raw_usage = event.get("usage", {})
-        usage = None
-        if raw_usage:
-            usage = Usage(input_tokens=raw_usage.get("input_tokens", 0), output_tokens=raw_usage.get("output_tokens", 0))
-        result["usage"] = usage
+        out["final"] = event.get("result", "")
+        out["session_id"] = event.get("session_id")
+        raw = event.get("usage", {})
+        if raw:
+            out["usage"] = Usage(input_tokens=raw.get("input_tokens", 0), output_tokens=raw.get("output_tokens", 0))
 
-    return result
+    return out
 
 
-def _parse_event_codex(event: dict, tool_calls: list) -> dict:
-    """解析 Codex JSONL 事件。"""
-    result = {"text": "", "tool": None, "final": None}
+def _parse_codex(event: dict, tool_calls: list) -> dict:
+    out = {"session_id": None, "text": "", "final": None, "usage": None}
 
-    if event.get("type") == "item.completed":
+    if event.get("type") == "thread.started":
+        out["session_id"] = event.get("thread_id")
+
+    elif event.get("type") == "item.completed":
         item = event.get("item", {})
-        item_type = item.get("type", "")
-
-        if item_type == "agent_message":
-            result["text"] = item.get("text", "")
-
-        elif item_type == "tool_call":
-            tool_calls.append({
-                "type": "call",
-                "name": item.get("name", ""),
-                "input": item.get("arguments", {}),
-            })
-
-        elif item_type == "tool_result":
-            if tool_calls:
-                tool_calls[-1]["result"] = item.get("output", "")
+        itype = item.get("type", "")
+        if itype == "agent_message":
+            out["text"] = item.get("text", "")
+        elif itype == "tool_call":
+            tool_calls.append({"type": "call", "name": item.get("name", ""), "input": item.get("arguments", {})})
+        elif itype == "tool_result" and tool_calls:
+            tool_calls[-1]["result"] = item.get("output", "")
 
     elif event.get("type") == "turn.completed":
-        usage_raw = event.get("usage", {})
-        usage = Usage(
-            input_tokens=usage_raw.get("input_tokens", 0),
-            output_tokens=usage_raw.get("output_tokens", 0),
-        ) if usage_raw else None
-        result["usage"] = usage
+        raw = event.get("usage", {})
+        if raw:
+            out["usage"] = Usage(input_tokens=raw.get("input_tokens", 0), output_tokens=raw.get("output_tokens", 0))
 
-    return result
+    return out
 
 
-def _parse_event_opencode(event: dict, tool_calls: list) -> dict:
-    """解析 OpenCode JSON 事件。"""
+def _parse_opencode(event: dict, tool_calls: list) -> dict:
     etype = event.get("type", "")
-    result = {"text": "", "tool": None, "final": None}
+    out = {"session_id": None, "text": "", "final": None, "usage": None}
 
-    if etype == "text":
-        result["text"] = event.get("part", {}).get("text", "")
+    if etype == "step_start":
+        out["session_id"] = event.get("sessionID")
+
+    elif etype == "text":
+        out["text"] = event.get("part", {}).get("text", "")
 
     elif etype == "tool_use":
         part = event.get("part", {})
@@ -132,22 +132,15 @@ def _parse_event_opencode(event: dict, tool_calls: list) -> dict:
         })
 
     elif etype == "step_finish":
-        part = event.get("part", {})
-        tokens = part.get("tokens", {})
-        usage = Usage(
-            input_tokens=tokens.get("input", 0) if tokens else 0,
-            output_tokens=tokens.get("output", 0) if tokens else 0,
-        ) if tokens else None
-        result["usage"] = usage
+        out["session_id"] = event.get("sessionID")
+        raw = event.get("part", {}).get("tokens", {})
+        if raw:
+            out["usage"] = Usage(input_tokens=raw.get("input", 0), output_tokens=raw.get("output", 0))
 
-    return result
+    return out
 
 
-PARSERS = {
-    "claude": _parse_event_claude,
-    "codex": _parse_event_codex,
-    "opencode": _parse_event_opencode,
-}
+PARSERS = {"claude": _parse_claude, "codex": _parse_codex, "opencode": _parse_opencode}
 
 
 # ── 公开接口 ──────────────────────────────────────────
@@ -158,31 +151,37 @@ async def run_cli_collect(
     model: str | None = None,
     max_turns: int = 10,
     work_dir: str | None = None,
+    session_id: str | None = None,
 ) -> dict:
-    """调用 CLI，收集事件返回 {result, tool_calls, model, usage}。"""
-    cmd = _build_cmd(backend, prompt, model, max_turns, work_dir)
+    """调用 CLI，支持 session_id 续接。返回 {result, tool_calls, usage, session_id}。"""
+    cmd = _build_cmd(backend, prompt, model, max_turns, work_dir, session_id)
+    logger.info("[%s] %s", backend, " ".join(cmd[:8]))
+
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=work_dir or settings.WORK_DIR,
     )
 
-    parser = PARSERS.get(backend, _parse_event_claude)
+    parser = PARSERS.get(backend, _parse_claude)
     text_parts = []
     tool_calls = []
     result_usage = None
+    new_session_id = None
 
     async for line in proc.stdout:
-        text = line.decode().strip()
-        if not text:
+        raw = line.decode().strip()
+        if not raw:
             continue
         try:
-            event = json.loads(text)
+            event = json.loads(raw)
         except json.JSONDecodeError:
             continue
         parsed = parser(event, tool_calls)
+        if parsed["session_id"] and not new_session_id:
+            new_session_id = parsed["session_id"]
         if parsed["text"]:
             text_parts.append(parsed["text"])
-        if "usage" in parsed and parsed["usage"]:
+        if parsed["usage"]:
             result_usage = parsed["usage"]
         if parsed["final"]:
             text_parts = [parsed["final"]]
@@ -192,7 +191,12 @@ async def run_cli_collect(
         stderr = (await proc.stderr.read()).decode().strip()
         raise RuntimeError(f"CLI 错误 (code {proc.returncode}): {stderr}")
 
-    return {"result": "".join(text_parts), "tool_calls": tool_calls, "usage": result_usage}
+    return {
+        "result": "".join(text_parts),
+        "tool_calls": tool_calls,
+        "usage": result_usage,
+        "session_id": new_session_id,
+    }
 
 
 async def run_cli_stream(
@@ -201,9 +205,10 @@ async def run_cli_stream(
     model: str | None = None,
     max_turns: int = 10,
     work_dir: str | None = None,
+    session_id: str | None = None,
 ) -> AsyncGenerator[str, None]:
     """流式：yield SSE 事件。"""
-    cmd = _build_cmd(backend, prompt, model, max_turns, work_dir)
+    cmd = _build_cmd(backend, prompt, model, max_turns, work_dir, session_id)
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=work_dir or settings.WORK_DIR,

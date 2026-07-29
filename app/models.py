@@ -19,6 +19,7 @@ class ChatRequest(BaseModel):
     max_turns: int = 10
     work_dir: str | None = None
     backend: str = "claude"  # claude | codex | opencode
+    reset_session: bool = False  # 重置会话，新开一个 CLI session
 
 
 # ── 响应 ──────────────────────────────────────────────

@@ -56,12 +56,30 @@ def create_conversation(title: str = "", backend: str = "claude") -> str:
         "id": cid,
         "title": title or f"对话-{now[:16]}",
         "backend": backend,
+        "sessions": {},  # {"claude": "session_id", "codex": "thread_id", ...}
         "messages": [],
         "created_at": now,
         "updated_at": now,
     }
     _save(_CONV_FILE, data)
     return cid
+
+
+def get_session_id(cid: str, backend: str) -> str | None:
+    data = _load(_CONV_FILE)
+    conv = data.get(cid)
+    if not conv:
+        return None
+    sid = conv.get("sessions", {}).get(backend)
+    return sid if sid else None
+
+
+def set_session_id(cid: str, backend: str, session_id: str):
+    data = _load(_CONV_FILE)
+    if cid not in data:
+        return
+    data[cid].setdefault("sessions", {})[backend] = session_id
+    _save(_CONV_FILE, data)
 
 
 def append_message(cid: str, role: str, content: str, model: str = "", usage: dict | None = None, tool_calls: list | None = None, backend: str = ""):
