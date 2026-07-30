@@ -98,9 +98,12 @@ async def _stream_response(req: ChatRequest, cid: str, session_id: str | None = 
                     ev = json.loads(event[6:])
                     ev_type = ev.get("event", "")
                     if ev_type == "result":
-                        full_text = ev.get("text", "")
+                        result_text = ev.get("text", "")
+                        # result 文本可能比已累积的更完整（Claude 后端）
+                        if result_text and len(result_text) > len(full_text):
+                            full_text = result_text
                     elif ev_type == "text":
-                        pass  # 增量文本已在 full_text 追踪之外
+                        full_text += ev.get("text", "")
                     elif ev_type == "session":
                         sid = ev.get("session_id")
                         if sid:

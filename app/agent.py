@@ -158,7 +158,8 @@ async def run_cli_collect(
     logger.info("[%s] %s", backend, " ".join(cmd[:8]))
 
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        *cmd, stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=work_dir or settings.WORK_DIR,
     )
 
@@ -226,7 +227,8 @@ async def run_cli_stream(
     logger.info("[%s stream] %s", backend, " ".join(cmd[:8]))
 
     proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        *cmd, stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=work_dir or settings.WORK_DIR,
     )
 

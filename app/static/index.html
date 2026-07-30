@@ -109,6 +109,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;backgrou
 const API = location.origin;
 let convId = null;
 let currentBackend = 'claude';
+let backendConvIds = {};  // 每个后端独立的 conversation id
 
 const chatEl = document.getElementById('chat');
 const input = document.getElementById('input');
@@ -123,6 +124,14 @@ document.querySelectorAll('.backend-btn').forEach(btn => {
     document.querySelectorAll('.backend-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     currentBackend = btn.dataset.be;
+    // 切换到该后端的对话
+    convId = backendConvIds[currentBackend] || null;
+    if (convId) {
+      loadConv(convId);
+    } else {
+      chatEl.innerHTML = '<div class="welcome">开始一个新的对话</div>';
+      chatTitle.textContent = '小助手';
+    }
   });
 });
 
@@ -159,8 +168,11 @@ async function loadConv(id) {
   chatEl.innerHTML = '';
   if (data.messages) data.messages.forEach(m => addMsg(m.role, m.content, m.tool_calls));
   chatTitle.textContent = data.title || id;
-  setBackend(data.backend || 'claude');
-  info.textContent = `${data.backend || 'claude'} · 对话 ${id}`;
+  // 切换到该对话所属的后端
+  currentBackend = data.backend || 'claude';
+  backendConvIds[currentBackend] = id;
+  setBackend(currentBackend);
+  info.textContent = `${currentBackend} · 对话 ${id}`;
   loadConvs();
 }
 
@@ -319,6 +331,8 @@ async function send() {
 
     // 最终渲染（去掉 streaming-cursor）
     msgDiv.innerHTML = renderAssistant();
+    // 保存该后端的 conversation id
+    if (convId) backendConvIds[currentBackend] = convId;
     info.textContent = `${currentBackend} · 对话 ${convId}`;
     loadConvs();
   } catch (e) {
