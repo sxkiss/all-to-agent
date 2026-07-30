@@ -80,7 +80,9 @@ async def chat(req: ChatRequest):
 
 async def _stream_response(req: ChatRequest, cid: str, session_id: str | None = None):
     full_text = ""
+    event_count = 0
     try:
+        logger.info("[%s] 开始流式请求 conv=%s session=%s", req.backend, cid, session_id)
         async for event in run_cli_stream(
             prompt=req.message,
             backend=req.backend,
@@ -90,19 +92,29 @@ async def _stream_response(req: ChatRequest, cid: str, session_id: str | None = 
             session_id=session_id,
         ):
             yield event
+            event_count += 1
             if event.startswith("data: ") and event.strip() != "data: [DONE]":
                 try:
                     ev = json.loads(event[6:])
-                    if ev.get("type") == "result":
-                        full_text = ev.get("result", "")
-                    # 保存 session_id
-                    sid = ev.get("session_id") or ev.get("thread_id") or ev.get("sessionID")
-                    if sid:
-                        store.set_session_id(cid, req.backend, sid)
+                    ev_type = ev.get("event", "")
+                    if ev_type == "result":
+                        full_text = ev.get("text", "")
+                    elif ev_type == "text":
+                        pass  # 增量文本已在 full_text 追踪之外
+                    elif ev_type == "session":
+                        sid = ev.get("session_id")
+                        if sid:
+                            store.set_session_id(cid, req.backend, sid)
+                    elif ev_type == "error":
+                        logger.warning("[%s] 流式错误: %s", req.backend, ev.get("text", ""))
                 except json.JSONDecodeError:
                     pass
+        logger.info("[%s] 流式请求完成 conv=%s events=%s full_text_len=%s", req.backend, cid, event_count, len(full_text))
     except Exception as e:
-        yield f"data: {json.dumps({'type': 'error', 'text': str(e)})}\n\n"
+        logger.exception("[%s] 流式请求异常 conv=%s", req.backend, cid)
+        yield f"data: {json.dumps({'event': 'error', 'text': str(e)})}\n\n"
 
     if full_text:
         store.append_message(cid, "assistant", full_text)
+    elif event_count <= 1:
+        logger.warning("[%s] 流式请求无有效事件 conv=%s events=%s", req.backend, cid, event_count)

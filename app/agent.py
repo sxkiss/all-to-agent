@@ -167,6 +167,16 @@ async def run_cli_collect(
     tool_calls = []
     result_usage = None
     new_session_id = None
+    stderr_lines = []
+
+    async def read_stderr():
+        async for line in proc.stderr:
+            decoded = line.decode().strip()
+            if decoded:
+                stderr_lines.append(decoded)
+                logger.debug("[%s] stderr: %s", backend, decoded)
+
+    stderr_task = asyncio.create_task(read_stderr())
 
     async for line in proc.stdout:
         raw = line.decode().strip()
@@ -175,6 +185,8 @@ async def run_cli_collect(
         try:
             event = json.loads(raw)
         except json.JSONDecodeError:
+            logger.warning("[%s] 无法解析为 JSON 的行: %s", backend, raw[:200])
+            text_parts.append(raw)  # 将非 JSON 文本也作为结果收集，避免静默丢失
             continue
         parsed = parser(event, tool_calls)
         if parsed["session_id"] and not new_session_id:
@@ -186,10 +198,12 @@ async def run_cli_collect(
         if parsed["final"]:
             text_parts = [parsed["final"]]
 
+    await stderr_task
     await proc.wait()
+
     if proc.returncode != 0:
-        stderr = (await proc.stderr.read()).decode().strip()
-        raise RuntimeError(f"CLI 错误 (code {proc.returncode}): {stderr}")
+        stderr_msg = "\n".join(stderr_lines) if stderr_lines else "(无 stderr 输出)"
+        raise RuntimeError(f"CLI 错误 (code {proc.returncode}): {stderr_msg}")
 
     return {
         "result": "".join(text_parts),
@@ -207,14 +221,135 @@ async def run_cli_stream(
     work_dir: str | None = None,
     session_id: str | None = None,
 ) -> AsyncGenerator[str, None]:
-    """流式：yield SSE 事件。"""
+    """流式：解析 CLI 事件，yield 结构化 SSE 事件。带心跳防超时。"""
     cmd = _build_cmd(backend, prompt, model, max_turns, work_dir, session_id)
+    logger.info("[%s stream] %s", backend, " ".join(cmd[:8]))
+
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         cwd=work_dir or settings.WORK_DIR,
     )
-    async for line in proc.stdout:
-        text = line.decode().strip()
-        if text:
-            yield f"data: {text}\n\n"
+
+    # stderr 异步读取防死锁
+    stderr_lines = []
+
+    async def _read_stderr():
+        async for line in proc.stderr:
+            d = line.decode().strip()
+            if d:
+                stderr_lines.append(d)
+                logger.debug("[%s stderr] %s", backend, d[:200])
+
+    stderr_task = asyncio.create_task(_read_stderr())
+
+    # stdout → Queue，方便在主线程中同时处理心跳
+    line_queue: asyncio.Queue[str | None] = asyncio.Queue()
+
+    async def _enqueue_stdout():
+        async for raw_line in proc.stdout:
+            line_queue.put_nowait(raw_line.decode().strip())
+        line_queue.put_nowait(None)  # EOF 信号
+
+    stdout_task = asyncio.create_task(_enqueue_stdout())
+
+    sent_text_len = 0
+    heartbeat_interval = 15  # 秒
+
+    while True:
+        try:
+            raw = await asyncio.wait_for(line_queue.get(), timeout=heartbeat_interval)
+        except asyncio.TimeoutError:
+            # 无数据 → 发心跳保活
+            yield ": heartbeat\n\n"
+            continue
+
+        if raw is None:
+            break  # stdout EOF
+
+        if not raw:
+            continue
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            yield f"data: {json.dumps({'event': 'text', 'text': raw})}\n\n"
+            continue
+
+        etype = event.get("type", "")
+
+        # ── Claude 后端 ──
+        if backend == "claude":
+            if etype == "system" and event.get("subtype") == "init":
+                sid = event.get("session_id")
+                if sid:
+                    yield f"data: {json.dumps({'event': 'session', 'session_id': sid})}\n\n"
+
+            elif etype == "assistant":
+                for block in event.get("message", {}).get("content", []):
+                    btype = block.get("type")
+                    if btype == "tool_use":
+                        yield f"data: {json.dumps({'event': 'tool_call', 'name': block.get('name', ''), 'input': block.get('input', {})})}\n\n"
+                    elif btype == "text":
+                        full_text = block.get("text", "")
+                        delta = full_text[sent_text_len:]
+                        if delta:
+                            yield f"data: {json.dumps({'event': 'text', 'text': delta})}\n\n"
+                            sent_text_len = len(full_text)
+
+            elif etype == "user":
+                for block in event.get("message", {}).get("content", []):
+                    if block.get("type") == "tool_result":
+                        yield f"data: {json.dumps({'event': 'tool_result', 'content': str(block.get('content', ''))[:500]})}\n\n"
+
+            elif etype == "result":
+                final = event.get("result", "")
+                sid = event.get("session_id")
+                usage = event.get("usage", {})
+                if final and len(final) > sent_text_len:
+                    yield f"data: {json.dumps({'event': 'text', 'text': final[sent_text_len:]})}\n\n"
+                yield f"data: {json.dumps({'event': 'result', 'text': final, 'session_id': sid, 'usage': usage})}\n\n"
+
+        # ── Codex 后端 ──
+        elif backend == "codex":
+            if etype == "thread.started":
+                sid = event.get("thread_id")
+                if sid:
+                    yield f"data: {json.dumps({'event': 'session', 'session_id': sid})}\n\n"
+            elif etype == "item.completed":
+                item = event.get("item", {})
+                itype = item.get("type", "")
+                if itype == "agent_message":
+                    yield f"data: {json.dumps({'event': 'text', 'text': item.get('text', '')})}\n\n"
+                elif itype == "tool_call":
+                    yield f"data: {json.dumps({'event': 'tool_call', 'name': item.get('name', ''), 'input': item.get('arguments', {})})}\n\n"
+                elif itype == "tool_result":
+                    yield f"data: {json.dumps({'event': 'tool_result', 'content': str(item.get('output', ''))[:500]})}\n\n"
+            elif etype == "turn.completed":
+                usage = event.get("usage", {})
+                yield f"data: {json.dumps({'event': 'result', 'text': '', 'usage': usage})}\n\n"
+
+        # ── OpenCode 后端 ──
+        elif backend == "opencode":
+            if etype == "step_start":
+                sid = event.get("sessionID")
+                if sid:
+                    yield f"data: {json.dumps({'event': 'session', 'session_id': sid})}\n\n"
+            elif etype == "text":
+                part = event.get("part", {})
+                delta = part.get("text", "")
+                if delta:
+                    yield f"data: {json.dumps({'event': 'text', 'text': delta})}\n\n"
+            elif etype == "tool_use":
+                part = event.get("part", {})
+                state = part.get("state", {})
+                yield f"data: {json.dumps({'event': 'tool_call', 'name': part.get('tool', ''), 'input': state.get('input', {})})}\n\n"
+            elif etype == "step_finish":
+                yield f"data: {json.dumps({'event': 'result', 'text': '', 'usage': event.get('part', {}).get('tokens', {})})}\n\n"
+
+    stdout_task.cancel()
+    await stderr_task
+    await proc.wait()
+
+    if proc.returncode != 0:
+        yield f"data: {json.dumps({'event': 'error', 'text': 'CLI 错误 (code ' + str(proc.returncode) + '): ' + chr(10).join(stderr_lines[-3:])})}\n\n"
+
     yield "data: [DONE]\n\n"
