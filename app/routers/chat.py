@@ -33,11 +33,20 @@ async def chat(req: ChatRequest):
 
     store.append_message(cid, "user", req.message, model=req.model or "", backend=req.backend)
 
+    with open('/tmp/debug_stream.log', 'a') as _df:
+        _df.write(f"[CHAT] cid={cid} session={session_id} stream={req.stream} backend={req.backend}\n")
+        _df.flush()
+
     if req.stream:
         return StreamingResponse(
             _stream_response(req, cid, session_id),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Conversation-Id": cid},
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Conversation-Id": cid,
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
         )
 
     try:
@@ -53,7 +62,7 @@ async def chat(req: ChatRequest):
         logger.exception("对话失败")
         return ChatResponse(conversation_id=cid, message=f"[错误] {e}")
 
-    # 保存 session_id 用于下次续接
+    # 保存 session_id 用于下次续接（可能因上下文降级而更新为新 session）
     if result.get("session_id"):
         store.set_session_id(cid, req.backend, result["session_id"])
 
@@ -82,6 +91,9 @@ async def _stream_response(req: ChatRequest, cid: str, session_id: str | None = 
     full_text = ""
     event_count = 0
     try:
+        import sys
+        with open('/tmp/debug_stream.log', 'a') as _df:
+            _df.write(f"[STREAM] 开始 conv={cid} session={session_id} backend={req.backend}\n")
         logger.info("[%s] 开始流式请求 conv=%s session=%s", req.backend, cid, session_id)
         async for event in run_cli_stream(
             prompt=req.message,
@@ -97,17 +109,16 @@ async def _stream_response(req: ChatRequest, cid: str, session_id: str | None = 
                 try:
                     ev = json.loads(event[6:])
                     ev_type = ev.get("event", "")
-                    if ev_type == "result":
-                        result_text = ev.get("text", "")
-                        # result 文本可能比已累积的更完整（Claude 后端）
-                        if result_text and len(result_text) > len(full_text):
-                            full_text = result_text
-                    elif ev_type == "text":
-                        full_text += ev.get("text", "")
-                    elif ev_type == "session":
+                    if ev_type == "session":
                         sid = ev.get("session_id")
                         if sid:
                             store.set_session_id(cid, req.backend, sid)
+                    elif ev_type == "text":
+                        full_text += ev.get("text", "")
+                    elif ev_type == "result":
+                        result_text = ev.get("text", "")
+                        if result_text and len(result_text) > len(full_text):
+                            full_text = result_text
                     elif ev_type == "error":
                         logger.warning("[%s] 流式错误: %s", req.backend, ev.get("text", ""))
                 except json.JSONDecodeError:

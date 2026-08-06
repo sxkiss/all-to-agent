@@ -1,7 +1,13 @@
-"""JSON 文件持久化存储：对话历史 + 定时任务。"""
+"""JSON 文件持久化存储：对话历史 + 定时任务。
+
+上下文管理：
+- MAX_MESSAGES_PER_CONVERSATION: 单个对话最大消息数（超过自动截断旧消息）
+- 截断时保留最近的消息，删除最早的用户/助手消息对
+"""
 
 from __future__ import annotations
 import json
+import logging
 import uuid
 from pathlib import Path
 from datetime import datetime
@@ -11,8 +17,13 @@ from app.models import (
     Conversation, Message, Task, TaskCreate, Usage,
 )
 
+logger = logging.getLogger("memory.store")
+
 _CONV_FILE = settings.MEMORY_DIR / "conversations.json"
 _TASK_FILE = settings.MEMORY_DIR / "tasks.json"
+
+# 单个对话最大消息数（超过自动截断旧消息，防止上下文过长）
+MAX_MESSAGES_PER_CONVERSATION = 100
 
 
 def _load(path: Path) -> dict:
@@ -99,6 +110,19 @@ def append_message(cid: str, role: str, content: str, model: str = "", usage: di
         data[cid]["backend"] = backend  # update conv-level too
     data[cid]["messages"].append(msg)
     data[cid]["updated_at"] = now
+
+    # 主动截断：超过最大消息数时删除旧消息（保留最近的消息）
+    messages = data[cid]["messages"]
+    if len(messages) > MAX_MESSAGES_PER_CONVERSATION:
+        trim_count = len(messages) - MAX_MESSAGES_PER_CONVERSATION
+        # 确保 trim_count 是偶数（保持 user/assistant 配对）
+        trim_count = trim_count + (trim_count % 2)
+        data[cid]["messages"] = messages[trim_count:]
+        logger.info(
+            "[%s] 对话 %s 截断 %d 条旧消息（剩余 %d 条）",
+            backend or "unknown", cid, trim_count, len(data[cid]["messages"])
+        )
+
     # 自动生成标题：取第一条用户消息前 30 字
     if role == "user" and not data[cid].get("title", "").startswith("对话-"):
         prefix = {"claude": "🤖", "codex": "📐", "opencode": "🔓"}.get(backend, "")

@@ -16,7 +16,7 @@ class ChatRequest(BaseModel):
     stream: bool = False
     system_prompt: str | None = None
     model: str | None = None
-    max_turns: int = 10
+    max_turns: int = 0  # 0=不限制，让CLI自行决定何时完成
     work_dir: str | None = None
     backend: str = "claude"  # claude | codex | opencode
     reset_session: bool = False  # 重置会话，新开一个 CLI session
