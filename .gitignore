@@ -4,3 +4,4 @@ __pycache__/
 .env
 memory/conversations.json
 memory/tasks.json
+logs/agent-api.log
